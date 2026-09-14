@@ -1,0 +1,1 @@
+CharioBet AI v0.2 SIMPLE\n\nVersion simplifiée pour déploiement depuis un téléphone : seulement app.py et requirements.txt. Les 2 660 matchs historiques Premier League 2019/20–2025/26 sont intégrés dans app.py.\n
