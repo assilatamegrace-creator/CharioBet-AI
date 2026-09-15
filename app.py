@@ -70,6 +70,162 @@ def render_ledger():
                        file_name="chariobet_journal_predictions.csv", mime="text/csv", use_container_width=True)
     st.caption("Le journal est volontairement séparé des résultats : une prédiction doit être enregistrée avant le résultat pour éviter le cherry-picking.")
 
+
+
+# ---------------- BSD (Bzzoiro Sports Data) ----------------
+BSD_BASE_URL = "https://sports.bzzoiro.com/api/v2/"
+
+def get_bsd_key():
+    try:
+        return st.secrets.get("BSD_API_KEY", os.getenv("BSD_API_KEY", ""))
+    except Exception:
+        return os.getenv("BSD_API_KEY", "")
+
+@st.cache_data(ttl=60)
+def bsd_get_cached(path, params_tuple=()):
+    key = get_bsd_key()
+    if not key:
+        return None, "Clé BSD_API_KEY absente"
+    try:
+        import requests
+        params = dict(params_tuple)
+        r = requests.get(
+            BSD_BASE_URL + path.lstrip("/"),
+            headers={"Authorization": f"Token {key}"},
+            params=params, timeout=15
+        )
+        if r.status_code == 401:
+            return None, "Clé BSD invalide ou absente (HTTP 401)."
+        if r.status_code == 402:
+            return None, "Cette ressource BSD nécessite un accès payant (HTTP 402)."
+        if r.status_code == 429:
+            return None, "Limite de requêtes BSD atteinte (HTTP 429)."
+        r.raise_for_status()
+        payload = r.json()
+        if isinstance(payload, dict) and payload.get("error"):
+            return None, str(payload["error"])
+        if isinstance(payload, dict) and payload.get("errors"):
+            return None, str(payload["errors"])
+        return payload, None
+    except Exception as e:
+        return None, f"Erreur BSD: {e}"
+
+def bsd_get(path, params=None):
+    return bsd_get_cached(path, tuple(sorted((params or {}).items())))
+
+def _bsd_name(value):
+    if isinstance(value, dict):
+        return value.get("name") or value.get("short_name") or value.get("team_name") or ""
+    return str(value or "")
+
+def parse_bsd_events(payload):
+    if isinstance(payload, dict):
+        items = payload.get("results") or payload.get("events") or []
+    else:
+        items = payload or []
+    rows = []
+    for e in items:
+        if not isinstance(e, dict):
+            continue
+        home = _bsd_name(e.get("home_team") or e.get("home"))
+        away = _bsd_name(e.get("away_team") or e.get("away"))
+        league = e.get("league") or {}
+        league_name = _bsd_name(league) if not isinstance(league, str) else league
+        country = ""
+        if isinstance(league, dict):
+            country = league.get("country") or league.get("country_name") or ""
+        event_id = e.get("id") or e.get("event_id")
+        kickoff = (e.get("kickoff") or e.get("kickoff_at") or e.get("event_date")
+                   or e.get("date") or e.get("start_time") or e.get("scheduled_at"))
+        status = str(e.get("status") or "").lower()
+        if status in ("inprogress", "in_progress", "live", "playing"):
+            status = "LIVE"
+        elif status == "upcoming":
+            status = "NS"
+        elif status in ("finished", "ft"):
+            status = "FT"
+        rows.append({
+            "fixture_id": event_id, "Date": kickoff, "status": status,
+            "HomeTeam": home, "AwayTeam": away, "League": league_name, "Country": country
+        })
+    return pd.DataFrame(rows)
+
+def bsd_fixtures(hours=8, live_only=False):
+    now = pd.Timestamp.now(tz="UTC")
+    if live_only:
+        payload, err = bsd_get("events/live/", {"limit": 200})
+        if err:
+            return pd.DataFrame(), err
+        df = parse_bsd_events(payload)
+        if not df.empty:
+            df["DateUTC"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+        return df, None
+
+    today = now.date().isoformat()
+    tomorrow = (now + pd.Timedelta(days=1)).date().isoformat()
+    payload, err = bsd_get("events/", {
+        "status": "upcoming", "date_from": today, "date_to": tomorrow, "limit": 200
+    })
+    if err:
+        return pd.DataFrame(), err
+    df = parse_bsd_events(payload)
+
+    live_payload, live_err = bsd_get("events/live/", {"limit": 200})
+    if live_err is None:
+        live_df = parse_bsd_events(live_payload)
+        if not live_df.empty:
+            df = pd.concat([df, live_df], ignore_index=True) if not df.empty else live_df
+
+    if df.empty:
+        return df, None
+    df["DateUTC"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
+    live_status = df["status"].isin(["LIVE", "1H", "HT", "2H", "ET", "BT", "P"])
+    end = now + pd.Timedelta(hours=hours)
+    df = df[live_status | ((df["DateUTC"] >= now) & (df["DateUTC"] <= end))]
+    return df.drop_duplicates(subset=["fixture_id"]).sort_values("DateUTC").reset_index(drop=True), None
+
+def parse_bsd_odds(payload):
+    if not isinstance(payload, dict):
+        return []
+    # Free BSD returns a consensus price block on the per-match endpoint.
+    odds = payload.get("odds") or {}
+    mapped = {}
+    key_map = {
+        "home_win": "1", "draw": "X", "away_win": "2",
+        "over_15_goals": "Over 1.5", "under_15_goals": "Under 1.5",
+        "over_25_goals": "Over 2.5", "under_25_goals": "Under 2.5",
+        "over_35_goals": "Over 3.5", "under_35_goals": "Under 3.5",
+        "btts_yes": "BTTS Oui", "btts_no": "BTTS Non"
+    }
+    for src, dst in key_map.items():
+        try:
+            v = odds.get(src)
+            if v is not None and float(v) > 1:
+                mapped[dst] = float(v)
+        except Exception:
+            pass
+    if mapped:
+        return [{"name": "BSD Consensus", "odds": mapped}]
+    return []
+
+@st.cache_data(ttl=180)
+def bsd_odds_for_event(event_id):
+    payload, err = bsd_get(f"events/{int(event_id)}/odds/")
+    if err:
+        return [], err
+    return parse_bsd_odds(payload), None
+
+def bsd_odds_map(fixtures):
+    result = {}
+    errors = []
+    # Keep the scan light: consensus odds are one extra request per displayed match.
+    for fid in fixtures.get("fixture_id", pd.Series(dtype=object)).dropna().tolist()[:30]:
+        books, err = bsd_odds_for_event(int(fid))
+        result[int(fid)] = books
+        if err:
+            errors.append(f"{fid}: {err}")
+    return result, errors
+
 def get_api_key():
     try:
         return st.secrets.get("API_FOOTBALL_KEY", os.getenv("API_FOOTBALL_KEY", ""))
@@ -152,7 +308,7 @@ def parse_odds_pages(items):
 def api_odds_for_date(date_str):
     all_items = []
     # API-Football paginates odds. Keep a safe cap so the free quota is not murdered by enthusiasm.
-    for page in range(1, 4):
+    for page in range(1, 11):
         items, err = api_get("odds", {"date": date_str, "page": page})
         if err: return {}, err
         if not items: break
@@ -331,15 +487,15 @@ with tab_tennis:
                     st.info("Le système cherche à réduire les erreurs en combinant plusieurs signaux et en abaissant la confiance quand des données essentielles manquent. Il ne peut pas garantir 80% de victoires ni éliminer les imprévus.")
 
 with tab_football:
-    api_key = get_api_key()
+    bsd_key = get_bsd_key()
 
-    st.caption("V0.9 • décision stricte • journal de prédictions • Match Rouge • combinés multi-matchs")
+    st.caption("V0.9 • décision stricte • journal de prédictions • Match Rouge • BSD Football API")
     st.warning("⚠️ Le module d'intégrité repère des anomalies de marché et de données. Il ne peut pas prouver qu'un match est truqué. Une alerte sérieuse doit être vérifiée par des données professionnelles et, idéalement, par un organisme d'intégrité.")
 
     with st.sidebar:
         st.header("⚙️ État du moteur")
-        if api_key: st.success("🟢 API-Football connectée")
-        else: st.error("🔴 API-Football absente")
+        if bsd_key: st.success("🟢 BSD connectée")
+        else: st.error("🔴 BSD_API_KEY absente")
         st.caption(f"Historique embarqué : {len(data)} matchs")
         st.caption("Volume réel des mises : non disponible avec cette API")
 
@@ -354,30 +510,19 @@ with tab_football:
     with col3:
         hours = st.slider("Prochaines heures", 2, 24, 8)
 
-    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
     fixtures = pd.DataFrame()
-    if api_key:
-        items, err = api_fixtures(today, live=live_only)
-        fixtures = parse_fixture_list(items)
+    if bsd_key:
+        fixtures, err = bsd_fixtures(hours=hours, live_only=live_only)
         if err: st.error(err)
-        if not fixtures.empty:
-            fixtures["DateUTC"] = pd.to_datetime(fixtures["Date"], utc=True, errors="coerce")
-            now = pd.Timestamp.now(tz="UTC")
-            live_status = fixtures["status"].isin(["1H","HT","2H","ET","BT","P","LIVE"])
-            if not live_only:
-                end = now + pd.Timedelta(hours=hours)
-                fixtures = fixtures[(live_status) | ((fixtures["DateUTC"] >= now) & (fixtures["DateUTC"] <= end))]
-            else:
-                fixtures = fixtures[live_status]
-            fixtures = fixtures.sort_values("DateUTC").reset_index(drop=True)
     else:
-        st.info("Ajoute API_FOOTBALL_KEY dans Streamlit Secrets pour activer le scan automatique.")
+        st.info("Ajoute BSD_API_KEY dans Streamlit Secrets pour activer le scan automatique.")
 
     if fixtures.empty:
         st.info("Aucun match dans la fenêtre sélectionnée.")
     else:
-        odds_map, odds_err = api_odds_for_date(today) if api_key else ({}, None)
-        if odds_err: st.warning(odds_err)
+        odds_map, odds_errors = bsd_odds_map(fixtures)
+        if odds_errors:
+            st.warning("Certaines cotes BSD n'ont pas pu être récupérées : " + " • ".join(odds_errors[:3]))
         scan_rows = []
         for _, row in fixtures.iterrows():
             try:
@@ -420,7 +565,7 @@ with tab_football:
         b.metric("Dispersion bookmakers", "Oui")
         c.metric("Mouvement de cote", "Session")
         d.metric("Volume des mises", "Non disponible")
-        st.caption("Le mouvement est comparé aux snapshots vus pendant cette session. L'API-Football conserve les cotes pré-match sur une fenêtre limitée et ne fournit pas l'intelligence client/volume nécessaire à une vraie plateforme d'intégrité.")
+        st.caption("Le mouvement est comparé aux snapshots vus pendant cette session. BSD fournit ici un prix consensus ; il ne s'agit pas d'un accès aux mises réelles des bookmakers.")
 
     # ---------------- MANUAL ----------------
     st.divider()
