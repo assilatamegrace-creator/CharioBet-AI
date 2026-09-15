@@ -152,7 +152,7 @@ def parse_odds_pages(items):
 def api_odds_for_date(date_str):
     all_items = []
     # API-Football paginates odds. Keep a safe cap so the free quota is not murdered by enthusiasm.
-    for page in range(1, 11):
+    for page in range(1, 4):
         items, err = api_get("odds", {"date": date_str, "page": page})
         if err: return {}, err
         if not items: break
