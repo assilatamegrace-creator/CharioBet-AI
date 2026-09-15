@@ -3,7 +3,13 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from core import fit_goal_model, probabilities, market_candidates, choose_best_market, integrity_proxy, build_combo
+from core_tennis import (tennis_probability, tennis_markets, tennis_best_pick, tennis_integrity_score,
+                          tennis_market_candidates, tennis_scenario_report)
+
+from core import (fit_goal_model, probabilities, market_candidates, choose_best_market,
+                  integrity_assessment, classify_integrity, build_combo, normalize_1x2_odds,
+                  devig_market_consensus, market_anchored_prob, decision_grade,
+                  select_consensus_market, combo_risk_adjusted, red_match_profile)
 
 st.set_page_config(page_title="CharioBet AI", page_icon="⚽", layout="wide")
 
@@ -18,9 +24,51 @@ def load_data():
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df.dropna(subset=["Date", "FTHG", "FTAG"]).sort_values("Date").reset_index(drop=True)
 
+def pct(x): return f"{float(x)*100:.1f}%"
 
-def pct(x): return f"{x*100:.1f}%"
 
+def init_ledger():
+    st.session_state.setdefault("prediction_ledger", [])
+
+def log_prediction(sport, match, market, probability, odds, verdict, score, integrity, source="manuel"):
+    init_ledger()
+    rec = {
+        "Horodatage UTC": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+        "Sport": sport, "Match": match, "Marché": market,
+        "Probabilité modèle": round(float(probability), 4) if probability is not None else None,
+        "Cote": round(float(odds), 3) if odds is not None else None,
+        "EV": round(float(probability) * float(odds) - 1, 4) if probability is not None and odds and odds > 1 else None,
+        "Verdict": verdict, "Score décision": score, "Intégrité": integrity, "Source": source,
+        "Résultat": "À régler", "Profit unité": None
+    }
+    st.session_state["prediction_ledger"].append(rec)
+
+def ledger_dataframe():
+    init_ledger()
+    return pd.DataFrame(st.session_state["prediction_ledger"])
+
+def render_ledger():
+    st.divider()
+    st.subheader("📒 Journal de prédictions")
+    df = ledger_dataframe()
+    if df.empty:
+        st.info("Aucune prédiction enregistrée dans cette session.")
+        return
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Prédictions", len(df))
+    settled = df[df["Résultat"].isin(["Gagné", "Perdu"])].copy()
+    if not settled.empty:
+        wins = int((settled["Résultat"] == "Gagné").sum())
+        profit = pd.to_numeric(settled["Profit unité"], errors="coerce").fillna(0).sum()
+        c2.metric("Taux de réussite", pct(wins/len(settled)))
+        c3.metric("Profit (unités)", f"{profit:+.2f}")
+    else:
+        c2.metric("Taux de réussite", "—")
+        c3.metric("Profit (unités)", "—")
+    st.dataframe(df, hide_index=True, use_container_width=True)
+    st.download_button("⬇️ Exporter le journal CSV", df.to_csv(index=False).encode("utf-8"),
+                       file_name="chariobet_journal_predictions.csv", mime="text/csv", use_container_width=True)
+    st.caption("Le journal est volontairement séparé des résultats : une prédiction doit être enregistrée avant le résultat pour éviter le cherry-picking.")
 
 def get_api_key():
     try:
@@ -28,18 +76,16 @@ def get_api_key():
     except Exception:
         return os.getenv("API_FOOTBALL_KEY", "")
 
-
-def api_get(path, params=None):
+@st.cache_data(ttl=60)
+def api_get_cached(path, params_tuple=()):
     key = get_api_key()
     if not key:
         return None, "Clé API-Football absente"
     try:
         import requests
-        r = requests.get(
-            "https://v3.football.api-sports.io/" + path,
-            headers={"x-apisports-key": key},
-            params=params or {}, timeout=15,
-        )
+        params = dict(params_tuple)
+        r = requests.get("https://v3.football.api-sports.io/" + path,
+                         headers={"x-apisports-key": key}, params=params, timeout=15)
         r.raise_for_status()
         payload = r.json()
         if payload.get("errors"):
@@ -48,202 +94,423 @@ def api_get(path, params=None):
     except Exception as e:
         return None, f"Erreur API: {e}"
 
+def api_get(path, params=None):
+    return api_get_cached(path, tuple(sorted((params or {}).items())))
 
 def api_fixtures(date_str, live=False):
-    params = {"live": "all"} if live else {"date": date_str}
-    return api_get("fixtures", params)
-
+    return api_get("fixtures", {"live": "all"} if live else {"date": date_str})
 
 def parse_fixture_list(items):
     rows = []
     for x in items or []:
-        f = x.get("fixture", {})
-        teams = x.get("teams", {})
-        league = x.get("league", {})
+        f, teams, league = x.get("fixture", {}), x.get("teams", {}), x.get("league", {})
         rows.append({
-            "fixture_id": f.get("id"),
-            "Date": f.get("date"),
+            "fixture_id": f.get("id"), "Date": f.get("date"),
             "status": (f.get("status") or {}).get("short", ""),
             "HomeTeam": (teams.get("home") or {}).get("name", ""),
             "AwayTeam": (teams.get("away") or {}).get("name", ""),
-            "League": league.get("name", ""),
-            "Country": league.get("country", ""),
+            "League": league.get("name", ""), "Country": league.get("country", ""),
         })
     return pd.DataFrame(rows)
 
-
-def fixture_odds(fixture_id):
-    items, err = api_get("odds", {"fixture": fixture_id})
-    if err or not items:
-        return {}, err
-    books = []
-    for item in items:
-        books.extend(item.get("bookmakers", []))
-    books = sorted(books, key=lambda b: 0 if "betclic" in b.get("name", "").lower() else 1)
+def parse_odds_bookmaker(bookmaker):
     out = {}
-    for b in books:
-        for bet in b.get("bets", []):
-            name = (bet.get("name") or "").lower()
-            for v in bet.get("values", []):
-                label = str(v.get("value", ""))
-                try:
-                    odd = float(v.get("odd"))
-                except Exception:
-                    continue
-                if name in ("match winner", "fulltime result") and label in ("Home", "Draw", "Away"):
-                    out[{"Home": "1", "Draw": "X", "Away": "2"}[label]] = odd
-                elif name in ("goals over/under", "over/under"):
-                    m = re.match(r"(Over|Under) (\d+(?:\.\d+)?)", label, re.I)
-                    if m:
-                        out[f"{m.group(1).title()} {float(m.group(2)):g}"] = odd
-                elif "both teams to score" in name:
-                    if label.lower() in ("yes", "no"):
-                        out["BTTS Oui" if label.lower() == "yes" else "BTTS Non"] = odd
-                elif "double chance" in name:
-                    if label in ("Home/Draw", "Draw/Home"):
-                        out["1X"] = odd
-                    elif label in ("Draw/Away", "Away/Draw"):
-                        out["X2"] = odd
-                    elif label in ("Home/Away", "Away/Home"):
-                        out["12"] = odd
-    return out, None
+    for bet in bookmaker.get("bets", []):
+        name = (bet.get("name") or "").lower()
+        for v in bet.get("values", []):
+            label = str(v.get("value", ""))
+            try: odd = float(v.get("odd"))
+            except Exception: continue
+            if odd <= 1: continue
+            if name in ("match winner", "fulltime result") and label in ("Home", "Draw", "Away"):
+                out[{"Home":"1", "Draw":"X", "Away":"2"}[label]] = odd
+            elif "goals over/under" in name or name == "over/under":
+                m = re.match(r"(Over|Under)\\s+(\\d+(?:\\.\\d+)?)", label, re.I)
+                if m: out[f"{m.group(1).title()} {float(m.group(2)):g}"] = odd
+            elif "both teams to score" in name or "both teams score" in name:
+                if label.lower() in ("yes", "no"):
+                    out["BTTS Oui" if label.lower()=="yes" else "BTTS Non"] = odd
+            elif "double chance" in name:
+                if label in ("Home/Draw", "Draw/Home"): out["1X"] = odd
+                elif label in ("Draw/Away", "Away/Draw"): out["X2"] = odd
+                elif label in ("Home/Away", "Away/Home"): out["12"] = odd
+    return out
 
+def parse_odds_pages(items):
+    result = {}
+    for item in items or []:
+        fid = (item.get("fixture") or {}).get("id")
+        if not fid: continue
+        books = []
+        for b in item.get("bookmakers", []):
+            parsed = parse_odds_bookmaker(b)
+            if parsed:
+                books.append({"name": b.get("name", ""), "odds": parsed})
+        result[int(fid)] = books
+    return result
+
+def api_odds_for_date(date_str):
+    all_items = []
+    # API-Football paginates odds. Keep a safe cap so the free quota is not murdered by enthusiasm.
+    for page in range(1, 11):
+        items, err = api_get("odds", {"date": date_str, "page": page})
+        if err: return {}, err
+        if not items: break
+        all_items.extend(items)
+        # If fewer than the usual page size arrive, we reached the end.
+        if len(items) < 10: break
+    return parse_odds_pages(all_items), None
+
+def preferred_odds(bookmakers):
+    if not bookmakers: return {}, None
+    ordered = sorted(bookmakers, key=lambda x: (0 if "betclic" in x.get("name", "").lower() else 1, x.get("name", "")))
+    return ordered[0]["odds"], ordered[0].get("name")
+
+def previous_snapshot(fid):
+    return st.session_state.get("odds_snapshots", {}).get(str(fid))
+
+def save_snapshot(fid, odds):
+    st.session_state.setdefault("odds_snapshots", {})[str(fid)] = dict(odds)
+
+def integrity_for_fixture(row, bookmakers, data):
+    bookmakers = sorted(bookmakers, key=lambda x: (0 if "betclic" in x.get("name", "").lower() else 1, x.get("name", "")))
+    odds, book_name = preferred_odds(bookmakers)
+    model = fit_goal_model(data, row["HomeTeam"], row["AwayTeam"])
+    probs = probabilities(model)
+    market_probs = normalize_1x2_odds(odds)
+    prev = previous_snapshot(row["fixture_id"])
+    quality_home = len(data[(data.HomeTeam == row["HomeTeam"]) | (data.AwayTeam == row["HomeTeam"])])
+    quality_away = len(data[(data.HomeTeam == row["AwayTeam"]) | (data.AwayTeam == row["AwayTeam"])])
+    quality = min(1.0, (quality_home + quality_away) / 30)
+    score, reasons, _ = integrity_assessment(
+        probs, market_probs,
+        bookmaker_odds=[b["odds"] for b in bookmakers],
+        previous_odds=prev,
+        league=row.get("League", ""),
+        data_quality=quality,
+    )
+    save_snapshot(row["fixture_id"], odds)
+    return {"score": score, "label": classify_integrity(score), "reasons": reasons,
+            "odds": odds, "bookmaker": book_name, "model": model, "probs": probs,
+            "market_probs": market_probs, "books": len(bookmakers), "history": quality}
 
 data = load_data()
 api_key = get_api_key()
 
-st.title("⚽ CharioBet AI")
-st.caption("V0.3 • analyse multi-marchés • combinés multi-matchs • données historiques + mode live optionnel")
-st.info("Les probabilités sont des estimations. L’Integrity Score détecte des anomalies de données/marché, pas des matchs truqués avec certitude.")
+tab_football, tab_tennis = st.tabs(["⚽ Football", "🎾 Tennis"])
 
-with st.sidebar:
-    st.header("⚙️ Mode")
-    if api_key:
-        st.success("🟢 Données live activées")
-    else:
-        st.warning("🟡 Mode historique/démo. Ajoute API_FOOTBALL_KEY dans les secrets Streamlit pour les matchs live.")
-    st.caption(f"Base historique : {len(data)} matchs")
+with tab_tennis:
+    st.title("🎾 CharioBet AI Tennis")
+    st.caption("Moteur tennis avancé • forme • surface • H2H • classement • Elo • fatigue • marchés • intégrité")
+    st.warning("⚠️ L'Integrity Score détecte des anomalies compatibles avec un risque d'intégrité. Il ne peut jamais prouver à lui seul qu'un match est truqué.")
 
-st.subheader("🗓️ Matchs automatiques")
-today = dt.date.today().isoformat()
-col1, col2, col3 = st.columns(3)
-with col1:
-    if st.button("🔄 Actualiser les matchs", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-with col2:
-    live_only = st.checkbox("🔴 Live uniquement")
-with col3:
-    hours = st.slider("Fenêtre", 2, 24, 8)
-
-fixtures = pd.DataFrame()
-if api_key:
-    items, err = api_fixtures(today, live=live_only)
-    fixtures = parse_fixture_list(items)
-    if err:
-        st.warning(err)
-    if not fixtures.empty:
-        fixtures["DateUTC"] = pd.to_datetime(fixtures["Date"], utc=True, errors="coerce")
-        fixtures = fixtures.sort_values("DateUTC")
-else:
-    st.caption("Aucun flux live sans clé API. L’analyse manuelle reste opérationnelle.")
-
-if fixtures.empty:
-    st.info("Aucun match automatique disponible dans le mode actuel. La fonction manuelle reste opérationnelle ci-dessous.")
-else:
-    st.dataframe(fixtures[["Date", "HomeTeam", "AwayTeam", "League", "status"]], hide_index=True, use_container_width=True)
-
-st.divider()
-st.subheader("🎯 Analyse d’un match")
-teams = sorted(set(data.HomeTeam) | set(data.AwayTeam))
-c1, c2 = st.columns(2)
-with c1:
-    home = st.selectbox("Domicile", teams, index=teams.index("Arsenal") if "Arsenal" in teams else 0)
-with c2:
-    opts = [t for t in teams if t != home]
-    away = st.selectbox("Extérieur", opts, index=opts.index("Chelsea") if "Chelsea" in opts else 0)
-
-st.caption("Cotes facultatives. Pour le moteur value, indique les cotes disponibles.")
-o1, o2, o3 = st.columns(3)
-with o1: odd1 = st.number_input("1", min_value=0.0, value=2.0, step=.01)
-with o2: oddx = st.number_input("X", min_value=0.0, value=3.4, step=.01)
-with o3: odd2 = st.number_input("2", min_value=0.0, value=3.5, step=.01)
-
-if st.button("🔎 ANALYSER", type="primary", use_container_width=True):
     try:
-        model = fit_goal_model(data, home, away)
-        probs = probabilities(model)
-        market_probs = {}
-        if odd1 > 1 and oddx > 1 and odd2 > 1:
-            inv = np.array([1 / odd1, 1 / oddx, 1 / odd2])
-            inv /= inv.sum()
-            market_probs = {"1": float(inv[0]), "X": float(inv[1]), "2": float(inv[2])}
-        home_n = len(data[(data.HomeTeam == home) | (data.AwayTeam == home)])
-        away_n = len(data[(data.HomeTeam == away) | (data.AwayTeam == away)])
-        quality = min(1.0, (home_n + away_n) / 30)
-        integrity, reasons = integrity_proxy(probs, market_probs, data_quality=quality)
-        st.markdown(f"### {home} vs {away}")
-        a, b, c = st.columns(3)
-        a.metric(home, pct(probs["1"]))
-        b.metric("Nul", pct(probs["X"]))
-        c.metric(away, pct(probs["2"]))
-        x, y = st.columns(2)
-        x.metric("Buts attendus domicile", f"{model.lambda_home:.2f}")
-        y.metric("Buts attendus extérieur", f"{model.lambda_away:.2f}")
-        st.markdown("### 🧩 Marchés disponibles dans le moteur")
-        md = market_candidates(model, {"1": odd1, "X": oddx, "2": odd2})
-        md["Probabilité"] = md["Probabilité"].map(pct)
-        md["EV"] = md["EV"].map(lambda x: "-" if pd.isna(x) else pct(x))
-        st.dataframe(md[["Marché", "Probabilité", "Cote", "EV", "Risque"]].head(25), hide_index=True, use_container_width=True)
-        st.markdown("### 🛡️ Integrity Score")
-        if integrity < 30:
-            st.success(f"{integrity}/100 🟢")
-        elif integrity < 60:
-            st.warning(f"{integrity}/100 🟠")
-        else:
-            st.error(f"{integrity}/100 🔴")
-        st.write(" • ".join(reasons))
-    except Exception as e:
-        st.error(f"Analyse impossible : {e}")
+        tennis_key = st.secrets.get("LIVE_TENNIS_API_KEY", os.getenv("LIVE_TENNIS_API_KEY", ""))
+    except Exception:
+        tennis_key = os.getenv("LIVE_TENNIS_API_KEY", "")
 
-st.divider()
-st.subheader("🎰 Générateur de combiné multi-matchs")
-profile = st.radio("Choisis le profil", ["Prudent", "Équilibré", "Grosse cote"], horizontal=True)
-st.caption("Chaque sélection vient d’un match différent. Le marché peut changer d’un match à l’autre.")
-
-if fixtures.empty:
-    st.info("Le générateur automatique a besoin des matchs du jour et de leurs cotes. Active le flux API pour l’utiliser automatiquement.")
-else:
-    selections = []
-    progress = st.progress(0.0)
-    total = len(fixtures)
-    for n, (_, row) in enumerate(fixtures.iterrows(), start=1):
+    @st.cache_data(ttl=120)
+    def tennis_api(path, params_tuple=()):
+        if not tennis_key: return None, "Clé LIVE_TENNIS_API_KEY absente"
         try:
-            home2, away2 = row["HomeTeam"], row["AwayTeam"]
-            model = fit_goal_model(data, home2, away2)
-            odds, _ = fixture_odds(int(row["fixture_id"]))
-            best = choose_best_market(model, odds)
-            if best:
-                integ, _ = integrity_proxy(probabilities(model), None)
-                if integ < 60:
-                    selections.append({
-                        "match": f"{home2} - {away2}",
-                        "market": best["Marché"],
-                        "prob": float(best["Probabilité"]),
-                        "odds": float(best["Cote"]),
-                        "ev": float(best["EV"] or 0),
-                        "integrity": integ,
-                    })
-        except Exception:
-            # One bad fixture must never break the entire app.
-            pass
-        progress.progress(n / total)
-    combo = build_combo(selections, profile)
-    if combo["selections"]:
-        st.success(f"Combiné {profile} • {len(combo['selections'])} matchs • cote totale ≈ {combo['odds']:.2f} • probabilité indépendante ≈ {pct(combo['prob'])}")
-        st.dataframe(pd.DataFrame(combo["selections"]), hide_index=True, use_container_width=True)
-        st.caption(combo["note"])
-    else:
-        st.warning("Aucun combiné suffisamment solide n’a été trouvé avec les filtres actuels.")
+            import requests
+            r=requests.get("https://api.livetennisapi.com/api/public/v1/"+path.lstrip("/"),
+                           headers={"X-API-Key":tennis_key}, params=dict(params_tuple), timeout=15)
+            payload=r.json()
+            if r.status_code>=400: return None, str(payload.get("detail") or payload.get("error") or f"HTTP {r.status_code}")
+            return payload.get("data", payload), None
+        except Exception as e: return None, f"Erreur API Tennis: {e}"
 
-st.caption("⚠️ V0.3 : les marchés de buts/BTTS/résultat sont calculés par le modèle. Les marchés comme corners/cartons nécessitent des données historiques dédiées avant d’être évalués proprement.")
+    if not tennis_key:
+        st.info("Ajoute **LIVE_TENNIS_API_KEY** dans Streamlit Secrets pour activer le tennis automatique.")
+    else:
+        st.success("🟢 API Tennis connectée")
+        c1,c2,c3=st.columns(3)
+        with c1: tennis_live=st.checkbox("🔴 Live uniquement", key="tennis_live_only")
+        with c2: tennis_hours=st.slider("Prochaines heures",2,24,8,key="tennis_hours")
+        with c3:
+            if st.button("🔄 Actualiser tennis",key="refresh_tennis",use_container_width=True): st.cache_data.clear(); st.rerun()
+
+        status="live" if tennis_live else "upcoming"
+        titems,terr=tennis_api("matches",tuple(sorted({"status":status,"limit":100}.items())))
+        if terr: st.error(terr); titems=[]
+        now=pd.Timestamp.now(tz="UTC"); end=now+pd.Timedelta(hours=tennis_hours)
+        tennis_rows=[]
+        for m in titems or []:
+            if not isinstance(m,dict): continue
+            start_t=pd.to_datetime(m.get("scheduled_time"),utc=True,errors="coerce")
+            live=str(m.get("status"))=="live"
+            if not tennis_live and not (live or (pd.notna(start_t) and now<=start_t<=end)): continue
+            players=m.get("players") or {}; p1=players.get("p1") or {}; p2=players.get("p2") or {}
+            surface=m.get("surface") or (m.get("tournament_data") or {}).get("surface")
+            h2h=m.get("h2h") or m.get("head_to_head")
+            prob=tennis_probability(p1,p2,surface,h2h,m.get("tournament"))
+            integrity,reasons=tennis_integrity_score(m)
+            best_of=str(m.get("format") or m.get("best_of") or "BO3").upper()
+            pick,pickprob=tennis_best_pick(prob,best_of)
+            tennis_rows.append({"match_id":m.get("id"),"Match":f"{p1.get('name','Joueur 1')} - {p2.get('name','Joueur 2')}",
+                "Tournoi":m.get("tournament","-"),"Tour":str(m.get("tour") or "-").upper(),"Surface":surface or "-",
+                "Heure UTC":start_t.strftime("%H:%M") if pd.notna(start_t) else ("LIVE" if live else "-"),
+                "Statut":"🔴 LIVE" if live else "🕐 À venir","P1":prob["1"],"P2":prob["2"],"Confiance":prob["confidence"],
+                "Marché conseillé":pick,"Prob marché":pickprob,"Intégrité":integrity,"Signaux":" • ".join(reasons[:3]),"raw":m})
+
+        if not tennis_rows: st.info("Aucun match tennis dans la fenêtre sélectionnée.")
+        else:
+            tdf=pd.DataFrame(tennis_rows)
+            flagged=tdf[tdf["Intégrité"]>=50].sort_values("Intégrité",ascending=False)
+            st.markdown("### 🔴 MATCHS ROUGES TENNIS — anomalies d’intégrité")
+            if flagged.empty: st.success("Aucun signal d'anomalie notable avec les données accessibles.")
+            else:
+                show=flagged.copy(); show["P1"]=show["P1"].map(pct); show["P2"]=show["P2"].map(pct); show["Confiance"]=show["Confiance"].map(pct)
+                st.dataframe(show[["Match","Tournoi","Tour","Surface","Heure UTC","P1","P2","Confiance","Intégrité","Signaux"]],hide_index=True,use_container_width=True)
+                st.caption("🔴 MATCH ROUGE = anomalie/suspicion, pas preuve de trucage. CharioBet affiche une projection sportive indépendante, mais bloque la recommandation automatique et le combiné.")
+                for _, tr in flagged.head(10).iterrows():
+                    try:
+                        raw=tr["raw"]; players=raw.get("players") or {}; pp1=players.get("p1") or {}; pp2=players.get("p2") or {}
+                        bo=str(raw.get("format") or raw.get("best_of") or "BO3").upper()
+                        td=tennis_probability(pp1,pp2,raw.get("surface"),raw.get("h2h") or raw.get("head_to_head"),raw.get("tournament"))
+                        tm=tennis_markets(td,bo)
+                        ranked=sorted([(v,k) for k,v in tm.items() if v>=0.55],reverse=True)[:4]
+                        st.markdown(f"**🔴 {tr['Match']}** · Integrity {int(tr['Intégrité'])}/100")
+                        st.write("Projection anti-piège, hors mouvements de cotes : " + " · ".join(f"{k}: {pct(v)}" for v,k in ranked))
+                        st.write("Décision : **NO BET / surveillance renforcée**. Une manipulation inconnue peut rendre une projection sportive non fiable.")
+                    except Exception:
+                        pass
+
+            st.markdown("### 🧠 Analyse automatique haut niveau")
+            picks=[]
+            for r in tennis_rows:
+                raw=r["raw"]; players=raw.get("players") or {}; p1=players.get("p1") or {}; p2=players.get("p2") or {}
+                prob=tennis_probability(p1,p2,r["Surface"] if r["Surface"]!="-" else None,raw.get("h2h") or raw.get("head_to_head"),raw.get("tournament"))
+                bo=str(raw.get("format") or raw.get("best_of") or "BO3").upper()
+                pick,pp=tennis_best_pick(prob,bo)
+                scenario=tennis_scenario_report(prob,bo,p1,p2)
+                picks.append({"Match":r["Match"],"Tournoi":r["Tournoi"],"Surface":r["Surface"],"Marché":pick,
+                              "Probabilité":pp,"Confiance":prob["confidence"],"Risque upset":scenario["upset_floor"],"Intégrité":r["Intégrité"]})
+            pdf=pd.DataFrame(picks).sort_values(["Confiance","Probabilité"],ascending=False)
+            for c in ["Probabilité","Confiance","Risque upset"]: pdf[c]=pdf[c].map(pct)
+            st.dataframe(pdf,hide_index=True,use_container_width=True)
+            st.caption("Le moteur pénalise la confiance lorsque surface, forme, H2H ou statistiques sont absents. Il ne promet jamais 80% de gains: une probabilité modèle n'est pas une garantie.")
+
+    st.divider(); st.markdown("### 🧪 Analyse manuelle complète d'un match tennis")
+    if tennis_key:
+        pcol1,pcol2=st.columns(2)
+        with pcol1: player1_name=st.text_input("Joueur 1",placeholder="Ex. Carlos Alcaraz",key="tennis_p1")
+        with pcol2: player2_name=st.text_input("Joueur 2",placeholder="Ex. Jannik Sinner",key="tennis_p2")
+        if st.button("🔎 ANALYSER LE MATCH TENNIS",type="primary",use_container_width=True):
+            if len(player1_name.strip())<3 or len(player2_name.strip())<3: st.error("Entre les deux noms de joueurs.")
+            else:
+                a1,e1=tennis_api("players",tuple(sorted({"search":player1_name.strip(),"limit":5}.items())))
+                a2,e2=tennis_api("players",tuple(sorted({"search":player2_name.strip(),"limit":5}.items())))
+                if e1 or e2 or not a1 or not a2: st.error(e1 or e2 or "Joueur introuvable.")
+                else:
+                    pp1,pp2=a1[0],a2[0]
+                    # Try to enrich the player matchup with H2H. If unavailable, continue honestly.
+                    h2h=None
+                    id1=pp1.get("id") or pp1.get("player_id"); id2=pp2.get("id") or pp2.get("player_id")
+                    if id1 and id2:
+                        h2h_data,herr=tennis_api(f"h2h/{id1}/{id2}")
+                        if not herr: h2h=h2h_data
+                    surface=st.selectbox("Surface",["hard","clay","grass","indoor hard","inconnue"],key="manual_surface")
+                    bo=st.selectbox("Format",["BO3","BO5"],key="manual_bo")
+                    d=tennis_probability(pp1,pp2,None if surface=="inconnue" else surface,h2h)
+                    st.markdown(f"### {pp1.get('name')} vs {pp2.get('name')}")
+                    x,y,z=st.columns(3); x.metric(pp1.get("name","Joueur 1"),pct(d["1"])); y.metric(pp2.get("name","Joueur 2"),pct(d["2"])); z.metric("Confiance",pct(d["confidence"]))
+                    x,y,z=st.columns(3); x.metric("Elo J1",f"{d['elo1']:.0f}"); y.metric("Elo J2",f"{d['elo2']:.0f}"); z.metric("Incertitude",pct(d["uncertainty"]))
+                    st.markdown("#### 🎯 Marchés analysés")
+                    md=tennis_market_candidates(d,None,bo); md["Probabilité"]=md["Probabilité"].map(pct)
+                    st.dataframe(md[["Marché","Probabilité","Risque"]],hide_index=True,use_container_width=True)
+                    scenario=tennis_scenario_report(d,bo,pp1,pp2)
+                    st.markdown("#### 🌪️ Scénarios imprévus")
+                    for s in scenario["scenarios"]: st.write("• "+s)
+                    st.markdown("#### 🛡️ Intégrité")
+                    integ,reasons=tennis_integrity_score({"players":{"p1":pp1,"p2":pp2},"surface":surface})
+                    label="🔴 surveillance élevée" if integ>=70 else "🟠 anomalie notable" if integ>=50 else "🟡 à surveiller" if integ>=30 else "🟢 aucun signal fort"
+                    st.write(f"**{integ}/100 • {label}**")
+                    st.write(" • ".join(reasons))
+                    st.info("Le système cherche à réduire les erreurs en combinant plusieurs signaux et en abaissant la confiance quand des données essentielles manquent. Il ne peut pas garantir 80% de victoires ni éliminer les imprévus.")
+
+with tab_football:
+    api_key = get_api_key()
+
+    st.caption("V0.9 • décision stricte • journal de prédictions • Match Rouge • combinés multi-matchs")
+    st.warning("⚠️ Le module d'intégrité repère des anomalies de marché et de données. Il ne peut pas prouver qu'un match est truqué. Une alerte sérieuse doit être vérifiée par des données professionnelles et, idéalement, par un organisme d'intégrité.")
+
+    with st.sidebar:
+        st.header("⚙️ État du moteur")
+        if api_key: st.success("🟢 API-Football connectée")
+        else: st.error("🔴 API-Football absente")
+        st.caption(f"Historique embarqué : {len(data)} matchs")
+        st.caption("Volume réel des mises : non disponible avec cette API")
+
+    # ---------------- AUTO SCAN ----------------
+    st.subheader("🚨 Surveillance automatique des matchs")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("🔄 Actualiser le scan", use_container_width=True):
+            st.cache_data.clear(); st.rerun()
+    with col2:
+        live_only = st.checkbox("🔴 Live uniquement")
+    with col3:
+        hours = st.slider("Prochaines heures", 2, 24, 8)
+
+    today = dt.datetime.now(dt.timezone.utc).date().isoformat()
+    fixtures = pd.DataFrame()
+    if api_key:
+        items, err = api_fixtures(today, live=live_only)
+        fixtures = parse_fixture_list(items)
+        if err: st.error(err)
+        if not fixtures.empty:
+            fixtures["DateUTC"] = pd.to_datetime(fixtures["Date"], utc=True, errors="coerce")
+            now = pd.Timestamp.now(tz="UTC")
+            live_status = fixtures["status"].isin(["1H","HT","2H","ET","BT","P","LIVE"])
+            if not live_only:
+                end = now + pd.Timedelta(hours=hours)
+                fixtures = fixtures[(live_status) | ((fixtures["DateUTC"] >= now) & (fixtures["DateUTC"] <= end))]
+            else:
+                fixtures = fixtures[live_status]
+            fixtures = fixtures.sort_values("DateUTC").reset_index(drop=True)
+    else:
+        st.info("Ajoute API_FOOTBALL_KEY dans Streamlit Secrets pour activer le scan automatique.")
+
+    if fixtures.empty:
+        st.info("Aucun match dans la fenêtre sélectionnée.")
+    else:
+        odds_map, odds_err = api_odds_for_date(today) if api_key else ({}, None)
+        if odds_err: st.warning(odds_err)
+        scan_rows = []
+        for _, row in fixtures.iterrows():
+            try:
+                assessment = integrity_for_fixture(row, odds_map.get(int(row["fixture_id"]), []), data)
+                scan_rows.append({
+                    "Match": f"{row['HomeTeam']} - {row['AwayTeam']}",
+                    "Compétition": row["League"],
+                    "Heure UTC": pd.to_datetime(row["Date"], utc=True).strftime("%H:%M"),
+                    "Intégrité": assessment["score"],
+                    "Statut": assessment["label"],
+                    "Bookmakers": assessment["books"],
+                    "Cote source": assessment["bookmaker"] or "-",
+                    "Signaux": " • ".join(assessment["reasons"][:2]),
+                    "Profil rouge": " • ".join(red_match_profile(assessment["score"], assessment["reasons"])["patterns"]),
+                    "fixture_id": row["fixture_id"],
+                })
+            except Exception as e:
+                scan_rows.append({"Match": f"{row['HomeTeam']} - {row['AwayTeam']}", "Compétition": row["League"],
+                                  "Heure UTC": "-", "Intégrité": 0, "Statut": "⚪ Données insuffisantes",
+                                  "Bookmakers": 0, "Cote source": "-", "Signaux": str(e), "fixture_id": row["fixture_id"]})
+
+        scan_df = pd.DataFrame(scan_rows)
+        flagged = scan_df[scan_df["Intégrité"] >= 50].sort_values("Intégrité", ascending=False)
+        normal = scan_df[scan_df["Intégrité"] < 50].sort_values("Intégrité", ascending=False)
+
+        st.markdown("### 🔴 Matchs à surveiller en priorité")
+        if flagged.empty:
+            st.success("Aucun match ne dépasse actuellement le seuil d'anomalie notable.")
+        else:
+            st.error(f"{len(flagged)} match(s) classé(s) MATCH ROUGE : signaux d’intégrité à examiner.")
+            st.dataframe(flagged.drop(columns=["fixture_id"]), hide_index=True, use_container_width=True)
+            st.caption("🔴 MATCH ROUGE = anomalie/suspicion à examiner, jamais preuve de trucage. La projection sportive est séparée du signal d’intégrité.")
+
+        st.markdown("### 🟢 Autres matchs de la fenêtre")
+        st.dataframe(normal.drop(columns=["fixture_id"]), hide_index=True, use_container_width=True)
+
+        st.markdown("### 🧪 Ce que CharioBet mesure")
+        a,b,c,d = st.columns(4)
+        a.metric("Écart modèle / marché", "Oui")
+        b.metric("Dispersion bookmakers", "Oui")
+        c.metric("Mouvement de cote", "Session")
+        d.metric("Volume des mises", "Non disponible")
+        st.caption("Le mouvement est comparé aux snapshots vus pendant cette session. L'API-Football conserve les cotes pré-match sur une fenêtre limitée et ne fournit pas l'intelligence client/volume nécessaire à une vraie plateforme d'intégrité.")
+
+    # ---------------- MANUAL ----------------
+    st.divider()
+    st.subheader("🎯 Analyse détaillée d’un match")
+    teams = sorted(set(data.HomeTeam) | set(data.AwayTeam))
+    c1,c2 = st.columns(2)
+    with c1: home = st.selectbox("Domicile", teams, index=teams.index("Arsenal") if "Arsenal" in teams else 0)
+    with c2:
+        opts=[t for t in teams if t != home]
+        away=st.selectbox("Extérieur", opts, index=opts.index("Chelsea") if "Chelsea" in opts else 0)
+    o1,o2,o3=st.columns(3)
+    with o1: odd1=st.number_input("Cote 1", min_value=0.0, value=2.0, step=.01)
+    with o2: oddx=st.number_input("Cote X", min_value=0.0, value=3.4, step=.01)
+    with o3: odd2=st.number_input("Cote 2", min_value=0.0, value=3.5, step=.01)
+
+    if st.button("🔎 ANALYSER", type="primary", use_container_width=True):
+        try:
+            model=fit_goal_model(data,home,away); probs=probabilities(model)
+            market_probs={}
+            if odd1>1 and oddx>1 and odd2>1:
+                market_probs=normalize_1x2_odds({"1":odd1,"X":oddx,"2":odd2})
+            score,reasons,_=integrity_assessment(probs,market_probs,league="",data_quality=1.0)
+            st.markdown(f"### {home} vs {away}")
+            a,b,c=st.columns(3); a.metric(home,pct(probs["1"])); b.metric("Nul",pct(probs["X"])); c.metric(away,pct(probs["2"]))
+            x,y=st.columns(2); x.metric("Buts attendus domicile",f"{model.lambda_home:.2f}"); y.metric("Buts attendus extérieur",f"{model.lambda_away:.2f}")
+            md=market_candidates(model,{"1":odd1,"X":oddx,"2":odd2})
+            md["Probabilité"]=md["Probabilité"].map(pct); md["EV"]=md["EV"].map(lambda x:"-" if pd.isna(x) else pct(x))
+            st.dataframe(md[["Marché","Probabilité","Cote","EV","Risque"]].head(30),hide_index=True,use_container_width=True)
+            st.markdown("### 🛡️ Integrity Score")
+            if score>=70: st.error(f"{score}/100 • 🔴 Surveillance élevée")
+            elif score>=50: st.warning(f"{score}/100 • 🟠 Anomalie notable")
+            elif score>=30: st.warning(f"{score}/100 • 🟡 À surveiller")
+            else: st.success(f"{score}/100 • 🟢 Aucun signal fort")
+            st.write(" • ".join(reasons))
+            # Enregistrement uniquement du signal réellement affiché, pour permettre un suivi pré-match.
+            best_row = md.iloc[0] if not md.empty else None
+            if best_row is not None and pd.notna(best_row.get("Cote")) and float(best_row.get("Cote", 0)) > 1:
+                st.session_state["pending_log"] = {
+                    "sport": "Football", "match": f"{home} - {away}",
+                    "market": str(best_row["Marché"]), "prob": float(md.iloc[0]["Probabilité"].rstrip("%"))/100 if isinstance(md.iloc[0]["Probabilité"], str) else float(best_row["Probabilité"]),
+                    "odds": float(best_row["Cote"]), "integrity": int(score),
+                }
+                if st.button("📌 Enregistrer cette prédiction", key="log_manual_football"):
+                    pr = st.session_state.pop("pending_log")
+                    ev = pr["prob"]*pr["odds"]-1
+                    verdict = "NO BET" if score >= 50 or ev < 0.05 else "SIGNAL VALIDE"
+                    log_prediction("Football", pr["match"], pr["market"], pr["prob"], pr["odds"], verdict, None, pr["integrity"])
+                    st.success("Prédiction enregistrée avant le résultat.")
+        except Exception as e: st.error(f"Analyse impossible : {e}")
+
+    # ---------------- COMBO ----------------
+    st.divider()
+    st.subheader("🎰 Générateur de combiné multi-matchs")
+    profile=st.radio("Choisis le profil",["Prudent","Équilibré","Grosse cote"],horizontal=True)
+    st.caption("Chaque sélection vient d’un match différent. CharioBet exclut automatiquement les matchs avec anomalie notable du combiné.")
+
+    if fixtures.empty:
+        st.info("Le combiné automatique nécessite des matchs live/à venir avec des cotes.")
+    else:
+        selections=[]
+        for _,row in fixtures.iterrows():
+            try:
+                books=odds_map.get(int(row["fixture_id"]),[])
+                odds,_=preferred_odds(books)
+                model=fit_goal_model(data,row["HomeTeam"],row["AwayTeam"])
+                best=choose_best_market(model,odds)
+                assess=integrity_for_fixture(row,books,data)
+                if best and assess["score"]<50:
+                    selections.append({"match":f"{row['HomeTeam']} - {row['AwayTeam']}","market":best["Marché"],
+                                       "prob":float(best["Probabilité"]),"odds":float(best["Cote"]),
+                                       "ev":float(best["EV"] or 0),"integrity":assess["score"]})
+            except Exception:
+                pass
+        combo=combo_risk_adjusted(selections,profile)
+        if combo["selections"]:
+            st.success(f"Combiné {profile} • {len(combo['selections'])} matchs • cote totale ≈ {combo['odds']:.2f} • probabilité indépendante ≈ {pct(combo['prob'])}")
+            st.dataframe(pd.DataFrame(combo["selections"]),hide_index=True,use_container_width=True)
+            st.caption(combo["note"])
+        else:
+            st.warning("Aucun combiné suffisamment solide et sans anomalie notable n’a été trouvé.")
+
+    st.divider()
+    st.subheader("🧠 Pourquoi CharioBet ne force plus un pronostic")
+    st.write("Le moteur combine modèle statistique, consensus de marché, valeur, qualité des données et intégrité. Si le signal ne passe pas les seuils, il affiche NO BET au lieu d'inventer une certitude.")
+    b1,b2,b3,b4=st.columns(4)
+    b1.metric("Modèle + marché", "Ensemble")
+    b2.metric("Valeur minimale", "+5%")
+    b3.metric("Intégrité élevée", "Exclue")
+    b4.metric("Prono forcé", "Non")
+
+    st.caption("🔴 Règle MATCH ROUGE : les anomalies sont classées à part, leurs projections sportives sont affichées séparément pour comprendre le scénario, mais elles sont bloquées des recommandations automatiques et des combinés. Les volumes financiers privés et alertes propriétaires ne sont pas accessibles via API-Football.")
+
+render_ledger()
